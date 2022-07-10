@@ -5,13 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path"
 	"syscall"
 	"time"
 
@@ -20,17 +18,17 @@ import (
 	"github.com/oracle/oci-go-sdk/v50/core"
 
 	"github.com/gorilla/mux"
-	bolt "go.etcd.io/bbolt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var localAddr *string = flag.String("l", "0.0.0.0:9999", "local address")
-var remoteAddr *string = flag.String("r", "localhost:8443", "remote address")
 var reconfigureBindAddr *string = flag.String("p", "0.0.0.0:8080", "private reconfigure address")
 
 var configBucket []byte = []byte("config")
 var whitelistIp []byte = []byte("whitelist_ip")
+var cachedIP string
 
-func whitelistFunc(client *bolt.DB) func(w http.ResponseWriter, r *http.Request) {
+func whitelistFunc(oci core.VirtualNetworkClient) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := r.Header.Get("X-Real-Ip")
 		parsed := net.ParseIP(ip)
@@ -39,85 +37,73 @@ func whitelistFunc(client *bolt.DB) func(w http.ResponseWriter, r *http.Request)
 			http.Error(w, "Invalid ip: "+ip, http.StatusBadRequest)
 			return
 		}
-
-		var cachedIP string
-		err := client.View(func(tx *bolt.Tx) error {
-			cached := tx.Bucket(configBucket).Get(whitelistIp)
-			cachedIP = string(cached)
-			return nil
-		})
+		err := whitelistOCI(r.Context(), oci, parsed.String())
 
 		if err != nil {
-			log.Println("error getting cached ip: ", err.Error())
+			log.Println("error whitelisting ip: ", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
-		}
-
-		if cachedIP != parsed.String() {
-			log.Println("Updating ip from ", cachedIP, " to ", ip)
-			cachedIP = ip
-
-			err := whitelistOCI(r.Context(), parsed.String())
-
-			if err != nil {
-				log.Println("error whitelisting ip: ", err.Error())
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			err = client.Update(func(tx *bolt.Tx) error {
-				return tx.Bucket(configBucket).Put(whitelistIp, []byte(parsed.String()))
-			})
-
-			if err != nil {
-				log.Println("error saving cached ip: ", err.Error())
-			}
 		}
 
 		w.Write([]byte(parsed.String()))
 	}
 }
 
-func setRemoteIpFunc(client *bolt.DB) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ip := r.Header.Get("X-Real-Ip")
-		parsed := net.ParseIP(ip)
-
-		if parsed == nil {
-			http.Error(w, "Invalid ip: "+ip, http.StatusBadRequest)
-			return
-		}
-		newAddr := parsed.String() + ":8443"
-		remoteAddr = &newAddr
-
-		_, _ = w.Write([]byte(parsed.String()))
-	}
-}
-
 func privateReconfigureWeb() {
-	dir, err := os.Getwd()
+
+	provider := common.DefaultConfigProvider()
+
+	if os.Getenv("LOCAL") == "" {
+		var err error
+		provider, err = auth.InstancePrincipalConfigurationProvider()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	oci, err := core.NewVirtualNetworkClientWithConfigurationProvider(provider)
+
 	if err != nil {
 		panic(err)
 	}
 
-	client, err := bolt.Open(path.Join(dir, "proxy.db"), 0600, &bolt.Options{Timeout: 3 * time.Second})
-	if err != nil {
-		panic(err)
-	}
-
-	err = client.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(configBucket)
-		return err
+	inFlightGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "in_flight_requests",
+		Help: "A gauge of requests currently being served by the wrapped handler.",
 	})
 
-	if err != nil {
-		panic(err)
-	}
+	counter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "api_requests_total",
+			Help: "A counter for requests to the wrapped handler.",
+		},
+		[]string{"code", "method"},
+	)
+
+	// duration is partitioned by the HTTP method and handler. It uses custom
+	// buckets based on the expected request duration.
+	duration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "request_duration_seconds",
+			Help:    "A histogram of latencies for requests.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"handler", "method"},
+	)
+
+	prometheus.MustRegister(inFlightGauge, counter, duration)
+	whitelistChain := promhttp.InstrumentHandlerInFlight(inFlightGauge,
+		promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"handler": "whitelist"}),
+			promhttp.InstrumentHandlerCounter(counter,
+				http.HandlerFunc(whitelistFunc(oci)),
+			),
+		),
+	)
 
 	r := mux.NewRouter()
 	r.Methods(http.MethodGet).Path("/health").HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	r.Methods(http.MethodPost).Path("/whitelist").HandlerFunc(whitelistFunc(client))
-	r.Methods(http.MethodPost).Path("/setRemoteIp").HandlerFunc(setRemoteIpFunc(client))
+	r.Methods(http.MethodPost).Path("/whitelist").Handler(whitelistChain)
+	r.Methods(http.MethodGet).Path("/metrics").Handler(promhttp.Handler())
 
 	// Create a CA certificate pool and add cert.pem to it
 	/*caCert, err := os.ReadFile("./ca.crt")
@@ -154,7 +140,7 @@ func privateReconfigureWeb() {
 
 func main() {
 	flag.Parse()
-	fmt.Printf("Listening: %v\nProxying: %v\n\n", *localAddr, *remoteAddr)
+	fmt.Printf("Listening: %v\n", *reconfigureBindAddr)
 
 	_, cancel := context.WithCancel(context.Background())
 	notChan := make(chan os.Signal, 2)
@@ -163,46 +149,12 @@ func main() {
 
 	go privateReconfigureWeb()
 
-	go func() {
-		listener, err := net.Listen("tcp", *localAddr)
-		if err != nil {
-			panic(err)
-		}
-		for {
-			conn, err := listener.Accept()
-			log.Println("New connection", conn.RemoteAddr())
-			if err != nil {
-				log.Println("error accepting connection", err)
-				continue
-			}
-			go func() {
-				defer conn.Close()
-				conn2, err := net.Dial("tcp", *remoteAddr)
-				if err != nil {
-					log.Println("error dialing remote addr", err)
-					return
-				}
-				defer conn2.Close()
-				closer := make(chan struct{}, 2)
-				go copyD(closer, conn2, conn)
-				go copyD(closer, conn, conn2)
-				<-closer
-				log.Println("Connection complete", conn.RemoteAddr())
-			}()
-		}
-	}()
-
 	<-notChan
 	cancel()
 	log.Println("Exiting")
 }
 
-func copyD(closer chan struct{}, dst io.Writer, src io.Reader) {
-	_, _ = io.Copy(dst, src)
-	closer <- struct{}{} // connection is closed, send signal to stop proxy
-}
-
-func whitelistOCI(ctx context.Context, ip string) error {
+func whitelistOCI(ctx context.Context, oci core.VirtualNetworkClient, ip string) error {
 	if ip == "" {
 		return errors.New("failed to resolve addresses")
 	}
@@ -213,27 +165,12 @@ func whitelistOCI(ctx context.Context, ip string) error {
 		return nil
 	}
 
-	provider := common.DefaultConfigProvider()
-
-	if os.Getenv("LOCAL") == "" {
-		var err error
-		provider, err = auth.InstancePrincipalConfigurationProvider()
-		if err != nil {
-			return err
-		}
-	}
-
-	oci, err := core.NewVirtualNetworkClientWithConfigurationProvider(provider)
-
-	if err != nil {
-		return err
-	}
-
 	policy := common.DefaultRetryPolicy()
 
 	resp, err := oci.ListNetworkSecurityGroupSecurityRules(ctx, core.ListNetworkSecurityGroupSecurityRulesRequest{
 		NetworkSecurityGroupId: common.String(os.Getenv("NSG_ID")),
 		RequestMetadata:        common.RequestMetadata{RetryPolicy: &policy},
+		Direction:              core.ListNetworkSecurityGroupSecurityRulesDirectionIngress,
 	})
 
 	if err != nil {
@@ -243,10 +180,16 @@ func whitelistOCI(ctx context.Context, ip string) error {
 	portMap := map[int]bool{80: true, 443: true, 7000: true}
 	var updatedRules = make([]core.UpdateSecurityRuleDetails, 0)
 
+	changed := false
 	for i := range resp.Items {
 		item := resp.Items[i]
 		if item.TcpOptions != nil && portMap[*item.TcpOptions.DestinationPortRange.Min] {
-			item.Source = common.String(ip + "/32")
+			newSource := common.String(ip + "/32")
+			if *newSource != *item.Source {
+				changed = true
+				cachedIP = *item.Source
+			}
+			item.Source = newSource
 			updatedRules = append(updatedRules, core.UpdateSecurityRuleDetails{
 				Direction:       core.UpdateSecurityRuleDetailsDirectionEnum(item.Direction),
 				Id:              item.Id,
@@ -260,6 +203,12 @@ func whitelistOCI(ctx context.Context, ip string) error {
 				TcpOptions:      item.TcpOptions,
 			})
 		}
+	}
+	if !changed {
+		log.Println("No change in security rules")
+		return nil
+	} else {
+		log.Println("Updating ip from ", cachedIP, " to ", ip)
 	}
 
 	_, err = oci.UpdateNetworkSecurityGroupSecurityRules(ctx, core.UpdateNetworkSecurityGroupSecurityRulesRequest{
